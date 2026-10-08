@@ -59,8 +59,10 @@ print(f"sum log p = {total.item():.3f}   mean log p = {mean.item():.3f}")
 # %%
 def my_dpo_loss(pc, pr, rc, rr, beta=0.1):
     """pc/pr: policy log-prob chosen/rejected; rc/rr: reference. Trả về loss trung bình."""
-    # TODO: viết bằng torch.nn.functional.logsigmoid
-    return None
+    chosen_reward = beta * (pc - rc)
+    rejected_reward = beta * (pr - rr)
+    loss = -torch.nn.functional.logsigmoid(chosen_reward - rejected_reward)
+    return loss.mean()
 
 
 # %%
@@ -122,6 +124,25 @@ for name, (pc_, pr_) in scenarios.items():
     print(f"{name:28s} RPO loss {M.rpo_loss(pc_, pr_, ref_c, ref_r, nll, beta=1.0).item():.3f}")
 
 # %% [markdown]
+# ### Trả lời: vì sao margin có thể tăng trong khi log-prob của `chosen` lại giảm?
+#
+# Margin = `rewards/chosen - rewards/rejected`, với mỗi reward là `beta * (log π_θ(y) - log π_ref(y))`.
+# Loss `-log σ(margin)` chỉ "nhìn" vào **hiệu số** này, không ràng buộc riêng từng số hạng. Vì vậy có hai
+# cách để margin tăng:
+#
+# 1. **Đúng kỳ vọng (INTENDED):** `chosen` tăng, `rejected` giảm.
+# 2. **Dịch chuyển xác suất (likelihood displacement):** cả hai cùng giảm, nhưng `rejected` giảm *nhanh
+#    hơn* `chosen`. Ví dụ kịch bản B ở trên: `chosen` giảm 3 nat, `rejected` giảm 5 nat — margin vẫn tăng
+#    2 nat giống kịch bản A (chosen tăng 1, rejected giảm 1), loss giống hệt nhau.
+#
+# Nguyên nhân: gradient của DPO đẩy xác suất **tương đối** giữa hai câu, không có lực nào giữ xác suất
+# tuyệt đối của `chosen` không giảm. Nếu hai câu có nhiều token chung ở đầu (ví dụ cùng mở đầu câu), giảm
+# xác suất của token chung đó làm giảm log-prob của *cả hai* câu, nhưng nếu `rejected` nhạy hơn với thay
+# đổi đó (ví dụ dài hơn, nhiều token "đặc trưng cho rejected" hơn) thì nó giảm nhanh hơn — margin vẫn tăng
+# dù `chosen` không được mô hình "ưa" hơn một cách tuyệt đối. Đây là lý do NB3 phải vẽ riêng đường
+# `rewards/chosen` thay vì chỉ nhìn margin: margin tăng không tự động nghĩa là mô hình trả lời tốt hơn.
+
+# %% [markdown]
 # ## 6. Bốn biến thể trên cùng một cặp
 #
 # | Loss | Cần mô hình tham chiếu (reference)? | Chuẩn hoá độ dài? | Ghi chú |
@@ -148,3 +169,18 @@ print(f"ORPO  {M.orpo_loss(avg_c, avg_r, -avg_c).item():.4f}")
 # **Câu hỏi cho REFLECTION §3:** tổng log-prob của câu dài luôn âm hơn câu ngắn.
 # Vì sao điều đó khiến DPO gốc dễ thiên vị độ dài, và SimPO/ORPO xử lý bằng cách nào?
 # Gợi ý: NB2 in ra tỉ lệ cặp có chosen dài hơn rejected trong dữ liệu tiếng Việt.
+#
+# **Trả lời:** `log π(y) = Σ_t log π(y_t | ...)` là **tổng** trên toàn bộ token của câu trả lời, và mỗi
+# số hạng đều âm (log của một xác suất < 1). Câu dài hơn cộng nhiều số hạng âm hơn nên tổng log-prob của
+# nó luôn âm hơn (nhỏ hơn) một câu ngắn, bất kể câu đó "hay" hay "dở" theo nghĩa con người. DPO gốc dùng
+# trực tiếp tổng này làm reward (`beta * (log π_θ - log π_ref)`), nên nếu dữ liệu có xu hướng `chosen` dài
+# hơn `rejected` (NB2 đo tỉ lệ này), mô hình có một đường tắt: **giảm xác suất câu ngắn** (`rejected`,
+# ít token để "chia đều" sự sụt giảm) thì margin cũng tăng mà không cần thực sự viết hay hơn — đây chính
+# là dịch chuyển xác suất (likelihood displacement) ở trên, và nó tương quan với độ dài.
+#
+# SimPO và ORPO tránh lỗi này bằng cách dùng **log-prob trung bình trên token** (`avg_logp = log π(y) / |y|`)
+# thay vì tổng — chia cho số token khử đi phần chênh lệch chỉ do độ dài, nên reward phản ánh "mức tự tin
+# trung bình mỗi token" chứ không phải "tổng điểm cộng dồn". Đổi lại, cả hai không cần mô hình tham chiếu
+# (reference-free): SimPO thêm một margin cố định `gamma` để thay vai trò neo mà `log π_ref` từng giữ,
+# còn ORPO cộng thêm NLL(chosen) để vẫn giữ mô hình bắt chước tốt câu `chosen` (giống SFT) song song với
+# việc tối đa hoá log-odds-ratio.
